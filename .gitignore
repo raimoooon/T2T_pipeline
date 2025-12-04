@@ -1,0 +1,28 @@
+# 実データ・中間ファイルは Git 管理外
+work/
+raw_sra/
+fastq/
+trimmed/
+bam/
+qc/
+logs/
+old_outputs_*/
+
+*.sra
+*.fastq
+*.fastq.gz
+*.bam
+*.bam.bai
+*.sam
+*.flagstat.txt
+*.log
+
+# 個人環境依存の設定
+config/config.sh
+
+# エディタ・OS 由来ファイル
+.DS_Store
+*.swp
+*.swo
+.Rhistory
+.RData
