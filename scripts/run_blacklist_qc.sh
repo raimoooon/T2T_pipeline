@@ -4,7 +4,7 @@
 #$ -pe OpenMP 4
 #$ -l mem_req=128G
 #$ -l h_vmem=32g
-#$ -N T2T_T2Tmap
+#$ -N T2T_BLQC
 #$ -o /home/raimoon/soturon/WGS_data/T2T_pipeline/work/logs/qsub_$JOB_ID.out
 #$ -e /home/raimoon/soturon/WGS_data/T2T_pipeline/work/logs/qsub_$JOB_ID.err
 #$ -j y
@@ -14,10 +14,8 @@ set -euo pipefail
 ########################################
 # 0. 設定ファイルの読み込み
 ########################################
-# このリポジトリの絶対パスを固定で指定
-REPO_ROOT="/home/raimoon/soturon/WGS_data/T2T_pipeline"
-
-# config.sh を読み込み
+# qsub を投げたディレクトリを REPO_ROOT とみなす
+REPO_ROOT="${SGE_O_WORKDIR:-/home/raimoon/soturon/WGS_data/T2T_pipeline}"
 source "${REPO_ROOT}/config/config.sh"
 
 echo "==== DEBUG PATHS ===="
@@ -30,6 +28,7 @@ echo "BAM_DIR       = ${BAM_DIR}"
 echo "FINAL_BAM_DIR = ${FINAL_BAM_DIR}"
 echo "QC_DIR        = ${QC_DIR}"
 echo "T2T_REF       = ${T2T_REF}"
+echo "BL_BED        = ${BL_BED:-NA}"
 echo "======================"
 
 ########################################
@@ -88,7 +87,6 @@ if [[ -f "${SRA_FILE}" ]]; then
   echo "  -> SRA already exists, skip prefetch"
 else
   echo "  -> SRA not found, run prefetch"
-  # 途中ファイルが残っていたら掃除
   rm -rf "${SRA_SUBDIR}"
   mkdir -p "${SRA_SUBDIR}"
 
@@ -125,10 +123,9 @@ else
       --split-files \
       --threads "${OMP_NUM_THREADS}" \
       -O "${FASTQ_DIR}" \
-      "${SRA_SUBDIR}/${SAMPLE}"
+      "${SRA_FILE}"
 fi
 
-# ここで本当にあるかチェック（なければ止める）
 if [[ ! -f "${FASTQ1}" || ! -f "${FASTQ2}" ]]; then
   echo "ERROR: FASTQ not found in ${FASTQ_DIR} for ${SAMPLE}" >&2
   ls -lh "${FASTQ_DIR}"
@@ -294,7 +291,7 @@ echo "  -> final BAM:"
 ls -lh "${FINAL_BAM}"*
 
 ########################################
-# 10. STEP 8: QC flagstat
+# 10. STEP 8: QC flagstat（全体 QC）
 ########################################
 echo "[STEP 8] Running flagstat (pre/post dedup) ..."
 
@@ -317,35 +314,75 @@ echo "  -> flagstat outputs:"
 ls -lh "${SORT_FLAGSTAT}" "${FINAL_FLAGSTAT}"
 
 ########################################
-# 11. STEP 9: ブラックリスト全領域の QC
+# 11. STEP 9: ブラックリスト全領域の QC（T2Tアーティファクト対策の肝）
 ########################################
-
 if [[ -f "${BL_BED}" ]]; then
   echo "[STEP 9] QC on all blacklist regions in ${BL_BED}"
 
+  # 全マップリード数（sorted / final）
+  TOTAL_MAPPED_SORT=$(
+    singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+      samtools view -c -F 4 "${SORT_BAM}"
+  )
+  TOTAL_MAPPED_FINAL=$(
+    singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+      samtools view -c -F 4 "${FINAL_BAM}"
+  )
+
   COV_TSV="${QC_DIR}/${SAMPLE}.blacklist_coverage.tsv"
-  : > "${COV_TSV}"   # 空ファイルで初期化
-  echo -e "region_name\tchr\tstart\tend\tmean_depth_sorted\tmean_depth_final" >> "${COV_TSV}"
+  : > "${COV_TSV}"
+  echo -e "region_name\tchr\tstart\tend\tlen\t"\
+"mean_depth_sorted\tmean_depth_final\t"\
+"sum_depth_sorted\tsum_depth_final\t"\
+"read_count_sorted\tread_count_final\t"\
+"frac_reads_sorted\tfrac_reads_final" >> "${COV_TSV}"
 
   while read -r CHR START END NAME; do
     REGION="${CHR}:${START}-${END}"
     [[ -z "${NAME}" ]] && NAME="${CHR}_${START}_${END}"
+    LEN=$(( END - START ))
 
     echo "  - processing ${NAME} (${REGION})"
 
-    # ① 各領域のカバレッジ要約（sorted）
-    MEAN_SORT=$(singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
-      samtools depth -r "${REGION}" "${SORT_BAM}" \
-      | awk '{sum+=$3; n++} END { if (n>0) printf "%.2f", sum/n; else print 0 }')
+    # depth から合計・平均カバレッジを計算（sorted）
+    read SUM_SORT MEAN_SORT <<< "$(
+      singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+        samtools depth -r "${REGION}" "${SORT_BAM}" \
+      | awk '{sum+=$3; n++} END { if (n>0) printf "%f %f", sum, sum/n; else print "0 0"}'
+    )"
 
-    # ② 各領域のカバレッジ要約（final）
-    MEAN_FINAL=$(singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
-      samtools depth -r "${REGION}" "${FINAL_BAM}" \
-      | awk '{sum+=$3; n++} END { if (n>0) printf "%.2f", sum/n; else print 0 }')
+    # depth から合計・平均カバレッジを計算（final）
+    read SUM_FINAL MEAN_FINAL <<< "$(
+      singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+        samtools depth -r "${REGION}" "${FINAL_BAM}" \
+      | awk '{sum+=$3; n++} END { if (n>0) printf "%f %f", sum, sum/n; else print "0 0"}'
+    )"
 
-    echo -e "${NAME}\t${CHR}\t${START}\t${END}\t${MEAN_SORT}\t${MEAN_FINAL}" >> "${COV_TSV}"
+    # リード本数（sorted / final）
+    READS_SORT=$(
+      singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+        samtools view -c "${SORT_BAM}" "${REGION}"
+    )
+    READS_FINAL=$(
+      singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
+        samtools view -c "${FINAL_BAM}" "${REGION}"
+    )
 
-    # ③ 代表 SAM（必要なら）
+    # 全マップリード数に対する割合
+    FRAC_SORT=$(awk -v r="${READS_SORT}" -v tot="${TOTAL_MAPPED_SORT}" \
+      'BEGIN{ if(tot>0) printf "%.6f", r/tot; else print 0 }')
+    FRAC_FINAL=$(awk -v r="${READS_FINAL}" -v tot="${TOTAL_MAPPED_FINAL}" \
+      'BEGIN{ if(tot>0) printf "%.6f", r/tot; else print 0 }')
+
+    printf "%s\t%s\t%d\t%d\t%d\t%.2f\t%.2f\t%.0f\t%.0f\t%d\t%d\t%.6f\t%.6f\n" \
+      "${NAME}" "${CHR}" "${START}" "${END}" "${LEN}" \
+      "${MEAN_SORT}" "${MEAN_FINAL}" \
+      "${SUM_SORT}" "${SUM_FINAL}" \
+      "${READS_SORT}" "${READS_FINAL}" \
+      "${FRAC_SORT}" "${FRAC_FINAL}" \
+      >> "${COV_TSV}"
+
+    # 代表 SAM（before / after）
     SORT_HEAD="${QC_DIR}/${SAMPLE}.sorted.${NAME}.head.sam"
     FINAL_HEAD="${QC_DIR}/${SAMPLE}.final.${NAME}.head.sam"
 
@@ -354,6 +391,7 @@ if [[ -f "${BL_BED}" ]]; then
 
     singularity exec --bind "${WORK_DIR}:${WORK_DIR}" "${SAMTOOLS_IMG}" \
       samtools view -h "${FINAL_BAM}" "${REGION}" | head -n 40 > "${FINAL_HEAD}"
+
   done < "${BL_BED}"
 
   echo "  -> blacklist coverage summary: ${COV_TSV}"

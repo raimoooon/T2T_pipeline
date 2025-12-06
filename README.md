@@ -7,10 +7,15 @@ UCSC `hs1`（T2T-CHM13v2.0）リファレンスにマッピングし、
 本来の目的は「統合失調症患者・健常者ニューロンの WGS を T2T にマッピングし、  
 転移因子（Transposable Elements; TE）解析につなげること」ですが、  
 任意のヒト WGS（SRA アクセッション）に対して利用可能な構成になっています。
+TE 解析に先立って行う前処理（トリミング・T2T へのマッピング）および
+品質管理（重複除去・flagstat など）を複数サンプルに対して一括実行するための
+パイプラインを提供します。
 
 ## 依存環境
 
 - ジョブスケジューラ: Sun Grid Engine (SGE, `qsub`)
+  -Sun Grid Engine (SGE) 環境を想定
+  -キュー名や並列環境名は各自のクラスター設定に合わせて変更してください。
 - コンテナ環境: Singularity（または Apptainer）
 - Singularity イメージ（パスは `config/config.sh` で指定）
   - `sratools.sif`  (prefetch, fasterq-dump)
